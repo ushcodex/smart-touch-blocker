@@ -10,7 +10,7 @@
 
     <uses-sdk
         android:minSdkVersion="29"
-        android:targetSdkVersion="29" />
+        android:targetSdkVersion="34" />
 
     <application
         android:label="Touch Blocker"
@@ -31,8 +31,7 @@
 
         <service
             android:name=".TouchBlockerService"
-            android:exported="false"
-            android:foregroundServiceType="specialUse" />
+            android:exported="false" />
 
         <receiver
             android:name=".BootReceiver"
