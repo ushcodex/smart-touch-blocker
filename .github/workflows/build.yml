@@ -87,5 +87,7 @@ jobs:
             - **Blocks ghost touches** from a malfunctioning touchscreen digitizer at the kernel overlay level
             - **Mouse clicks pass through** unaffected (via dynamic `FLAG_NOT_TOUCHABLE` toggle)
             - Runs as a persistent foreground service with a notification + floating ✕ button to stop
-          files: apk/app/build/outputs/apk/debug/app-debug.apk
+          files: |
+            apk/app/build/outputs/apk/debug/app-debug.apk
+            apk/app/build/outputs/apk/release/app-release.apk
           fail_on_unmatched_files: true
