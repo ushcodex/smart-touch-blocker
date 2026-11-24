@@ -3,7 +3,6 @@ package com.touchblocker;
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
 import android.content.Context;
-import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
@@ -18,23 +17,25 @@ import android.view.View;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
 import android.widget.TextView;
+
+import java.util.List;
 
 public class SmartBlockerAccessibilityService extends AccessibilityService {
 
     private static final String TAG = "TouchBlockerA11y";
-
     private static volatile SmartBlockerAccessibilityService sInstance = null;
 
     private WindowManager mWindowManager;
     private View mOverlayView;
-    private View mFloatingPill;
+    private TextView mFloatingPill;
     private WindowManager.LayoutParams mOverlayParams;
 
     private final Handler mHandler = new Handler(Looper.getMainLooper());
     private boolean mIsBlocking = true;
     private long mGhostCount = 0;
-    private boolean mIsDispatching = false;
+    private boolean mIsForwarding = false;
 
     public static SmartBlockerAccessibilityService getInstance() {
         return sInstance;
@@ -54,6 +55,7 @@ public class SmartBlockerAccessibilityService extends AccessibilityService {
 
     public void setBlocking(boolean block) {
         mIsBlocking = block;
+        updateOverlayState();
         updateFloatingPillUI();
     }
 
@@ -61,9 +63,26 @@ public class SmartBlockerAccessibilityService extends AccessibilityService {
         setBlocking(!mIsBlocking);
     }
 
+    private void updateOverlayState() {
+        if (mOverlayView != null && mOverlayParams != null && mWindowManager != null) {
+            if (mIsBlocking) {
+                // ACTIVE: Overlay absorbs touches (NOT touchable flag is removed)
+                mOverlayParams.flags &= ~WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+            } else {
+                // PAUSED: Overlay becomes 100% touch-transparent
+                mOverlayParams.flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+            }
+            try {
+                mWindowManager.updateViewLayout(mOverlayView, mOverlayParams);
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to update overlay flags", e);
+            }
+        }
+    }
+
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        // Not used
+        // Not needed for filtering
     }
 
     @Override
@@ -96,12 +115,9 @@ public class SmartBlockerAccessibilityService extends AccessibilityService {
         mOverlayView = new View(this) {
             @Override
             public boolean onTouchEvent(MotionEvent event) {
-                if (!mIsBlocking) {
-                    return false; // Paused -> let all input pass
-                }
-
-                if (mIsDispatching) {
-                    return false; // Let our own synthetic gesture pass through
+                // If paused or currently forwarding a gesture, pass through
+                if (!mIsBlocking || mIsForwarding) {
+                    return false;
                 }
 
                 int toolType = event.getToolType(0);
@@ -114,20 +130,20 @@ public class SmartBlockerAccessibilityService extends AccessibilityService {
 
                 if (!isMouse) {
                     // TOUCHSCREEN GHOST TOUCH!
-                    // Absorb it completely.
+                    // Absorb completely so it never reaches any app
                     if (event.getAction() == MotionEvent.ACTION_DOWN) {
                         mGhostCount++;
                     }
                     return true;
                 }
 
-                // MOUSE CLICK
+                // MOUSE INPUT
                 int action = event.getActionMasked();
                 float rawX = event.getRawX();
                 float rawY = event.getRawY();
 
                 if (action == MotionEvent.ACTION_DOWN) {
-                    forwardMouseClick(rawX, rawY);
+                    forwardClick(rawX, rawY);
                 }
 
                 return true; // Consumed
@@ -135,7 +151,13 @@ public class SmartBlockerAccessibilityService extends AccessibilityService {
 
             @Override
             public boolean onGenericMotionEvent(MotionEvent event) {
-                // Mouse hover and scroll wheel -> pass through so cursor moves freely
+                // Mouse hover and scroll wheel
+                if (event.getAction() == MotionEvent.ACTION_SCROLL) {
+                    float vscroll = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
+                    if (vscroll != 0) {
+                        forwardScroll(event.getRawX(), event.getRawY(), vscroll > 0);
+                    }
+                }
                 return false;
             }
         };
@@ -170,64 +192,53 @@ public class SmartBlockerAccessibilityService extends AccessibilityService {
         }
     }
 
-    // ── Mouse Click Forwarding via Accessibility Gestures ───────────────────
+    // ── Mouse Click & Scroll Forwarding ────────────────────────────────────
 
-    private void forwardMouseClick(float x, float y) {
-        // Strategy 1: Check accessibility node tree first for direct click
-        boolean nodeClicked = false;
-        try {
-            AccessibilityNodeInfo root = getRootInActiveWindow();
-            if (root != null) {
-                AccessibilityNodeInfo target = findClickableNodeAt(root, (int) x, (int) y);
-                if (target != null) {
-                    nodeClicked = target.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-                    target.recycle();
-                }
-                root.recycle();
-            }
-        } catch (Exception ignored) {}
-
-        // If direct node click succeeded, we're done!
-        if (nodeClicked) {
+    private void forwardClick(float x, float y) {
+        // Strategy 1: Find clickable node in active interactive window
+        boolean clicked = tryNodeClick((int) x, (int) y);
+        if (clicked) {
             return;
         }
 
-        // Strategy 2: Dispatch synthetic gesture into underlying view
-        mIsDispatching = true;
-
-        // Temporarily make overlay untouchable so the synthetic gesture hits the window behind
-        if (mOverlayView != null && mOverlayParams != null) {
+        // Strategy 2: Gesture dispatch with proper vsync delay so WindowManager
+        // applies FLAG_NOT_TOUCHABLE before the gesture is injected
+        mIsForwarding = true;
+        if (mOverlayView != null && mOverlayParams != null && mWindowManager != null) {
             mOverlayParams.flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
             try {
                 mWindowManager.updateViewLayout(mOverlayView, mOverlayParams);
             } catch (Exception ignored) {}
         }
 
-        Path clickPath = new Path();
-        clickPath.moveTo(x, y);
+        // Wait 25ms (1.5 frames) for WindowManagerService to apply the flag
+        mHandler.postDelayed(() -> {
+            Path clickPath = new Path();
+            clickPath.moveTo(x, y);
 
-        GestureDescription.Builder builder = new GestureDescription.Builder();
-        builder.addStroke(new GestureDescription.StrokeDescription(clickPath, 0, 10));
+            GestureDescription.Builder builder = new GestureDescription.Builder();
+            builder.addStroke(new GestureDescription.StrokeDescription(clickPath, 0, 15));
 
-        dispatchGesture(builder.build(), new GestureResultCallback() {
-            @Override
-            public void onCompleted(GestureDescription gestureDescription) {
-                restoreOverlay();
-            }
+            dispatchGesture(builder.build(), new GestureResultCallback() {
+                @Override
+                public void onCompleted(GestureDescription gestureDescription) {
+                    mHandler.postDelayed(() -> restoreOverlay(), 35);
+                }
 
-            @Override
-            public void onCancelled(GestureDescription gestureDescription) {
-                restoreOverlay();
-            }
-        }, mHandler);
+                @Override
+                public void onCancelled(GestureDescription gestureDescription) {
+                    restoreOverlay();
+                }
+            }, mHandler);
 
-        // Safety fallback timer to restore touchability
-        mHandler.postDelayed(this::restoreOverlay, 35);
+            // Safety timeout
+            mHandler.postDelayed(this::restoreOverlay, 80);
+        }, 25);
     }
 
     private void restoreOverlay() {
-        mIsDispatching = false;
-        if (mOverlayView != null && mOverlayParams != null) {
+        mIsForwarding = false;
+        if (mOverlayView != null && mOverlayParams != null && mWindowManager != null && mIsBlocking) {
             mOverlayParams.flags &= ~WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
             try {
                 mWindowManager.updateViewLayout(mOverlayView, mOverlayParams);
@@ -235,47 +246,138 @@ public class SmartBlockerAccessibilityService extends AccessibilityService {
         }
     }
 
-    private AccessibilityNodeInfo findClickableNodeAt(AccessibilityNodeInfo parent, int x, int y) {
-        if (parent == null) return null;
+    private boolean tryNodeClick(int x, int y) {
+        try {
+            List<AccessibilityWindowInfo> windows = getWindows();
+            if (windows == null || windows.isEmpty()) {
+                AccessibilityNodeInfo root = getRootInActiveWindow();
+                if (root != null) {
+                    boolean res = clickNodeAt(root, x, y);
+                    root.recycle();
+                    return res;
+                }
+                return false;
+            }
+
+            for (AccessibilityWindowInfo window : windows) {
+                // Skip our own overlay window
+                if (window.getType() == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY) {
+                    continue;
+                }
+
+                Rect windowBounds = new Rect();
+                window.getBoundsInScreen(windowBounds);
+                if (windowBounds.contains(x, y)) {
+                    AccessibilityNodeInfo root = window.getRoot();
+                    if (root != null) {
+                        boolean clicked = clickNodeAt(root, x, y);
+                        root.recycle();
+                        if (clicked) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+        return false;
+    }
+
+    private boolean clickNodeAt(AccessibilityNodeInfo parent, int x, int y) {
+        if (parent == null) return false;
 
         Rect bounds = new Rect();
         parent.getBoundsInScreen(bounds);
 
         if (!bounds.contains(x, y)) {
-            return null;
+            return false;
         }
 
-        // Check children from last to first (top of z-order)
-        int childCount = parent.getChildCount();
-        for (int i = childCount - 1; i >= 0; i--) {
+        // Search children from top to bottom
+        int count = parent.getChildCount();
+        for (int i = count - 1; i >= 0; i--) {
             AccessibilityNodeInfo child = parent.getChild(i);
             if (child != null) {
-                AccessibilityNodeInfo target = findClickableNodeAt(child, x, y);
-                if (target != null) {
-                    return target;
+                if (clickNodeAt(child, x, y)) {
+                    child.recycle();
+                    return true;
                 }
                 child.recycle();
             }
         }
 
         if (parent.isClickable() || parent.isCheckable() || parent.isFocusable()) {
+            return parent.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+        }
+
+        return false;
+    }
+
+    private void forwardScroll(float x, float y, boolean scrollUp) {
+        try {
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            if (root != null) {
+                AccessibilityNodeInfo scrollable = findScrollableAt(root, (int) x, (int) y);
+                if (scrollable != null) {
+                    int action = scrollUp
+                            ? AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+                            : AccessibilityNodeInfo.ACTION_SCROLL_FORWARD;
+                    scrollable.performAction(action);
+                    scrollable.recycle();
+                    root.recycle();
+                    return;
+                }
+                root.recycle();
+            }
+        } catch (Exception ignored) {}
+
+        // Fallback: Dispatch drag gesture
+        Path scrollPath = new Path();
+        float dy = scrollUp ? 300 : -300;
+        scrollPath.moveTo(x, y);
+        scrollPath.lineTo(x, y + dy);
+
+        GestureDescription.Builder builder = new GestureDescription.Builder();
+        builder.addStroke(new GestureDescription.StrokeDescription(scrollPath, 0, 100));
+        dispatchGesture(builder.build(), null, null);
+    }
+
+    private AccessibilityNodeInfo findScrollableAt(AccessibilityNodeInfo parent, int x, int y) {
+        if (parent == null) return null;
+
+        Rect bounds = new Rect();
+        parent.getBoundsInScreen(bounds);
+        if (!bounds.contains(x, y)) return null;
+
+        int count = parent.getChildCount();
+        for (int i = count - 1; i >= 0; i--) {
+            AccessibilityNodeInfo child = parent.getChild(i);
+            if (child != null) {
+                AccessibilityNodeInfo s = findScrollableAt(child, x, y);
+                if (s != null) {
+                    return s;
+                }
+                child.recycle();
+            }
+        }
+
+        if (parent.isScrollable()) {
             return AccessibilityNodeInfo.obtain(parent);
         }
 
         return null;
     }
 
-    // ── Floating Status Pill (Corner indicator & pause button) ─────────────
+    // ── Floating Pill (Corner Indicator & One-Click Pause) ──────────────────
 
     private void initFloatingPill() {
-        TextView pill = new TextView(this);
-        pill.setText("🛡️ BLOCKING");
-        pill.setTextColor(Color.WHITE);
-        pill.setTextSize(11);
-        pill.setPadding(18, 10, 18, 10);
-        pill.setBackgroundColor(Color.parseColor("#CC1B5E20"));
+        mFloatingPill = new TextView(this);
+        mFloatingPill.setText("🛡️ BLOCKING");
+        mFloatingPill.setTextColor(Color.WHITE);
+        mFloatingPill.setTextSize(11);
+        mFloatingPill.setPadding(16, 8, 16, 8);
+        mFloatingPill.setBackgroundColor(Color.parseColor("#CC1B5E20"));
 
-        pill.setOnClickListener(v -> toggleBlocking());
+        mFloatingPill.setOnClickListener(v -> toggleBlocking());
 
         WindowManager.LayoutParams p = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -285,24 +387,22 @@ public class SmartBlockerAccessibilityService extends AccessibilityService {
                 PixelFormat.TRANSLUCENT
         );
         p.gravity = Gravity.TOP | Gravity.END;
-        p.x = 20;
+        p.x = 24;
         p.y = 80;
 
-        mFloatingPill = pill;
         try {
             mWindowManager.addView(mFloatingPill, p);
         } catch (Exception ignored) {}
     }
 
     private void updateFloatingPillUI() {
-        if (mFloatingPill instanceof TextView) {
-            TextView tv = (TextView) mFloatingPill;
+        if (mFloatingPill != null) {
             if (mIsBlocking) {
-                tv.setText("🛡️ BLOCKING");
-                tv.setBackgroundColor(Color.parseColor("#CC1B5E20"));
+                mFloatingPill.setText("🛡️ BLOCKING");
+                mFloatingPill.setBackgroundColor(Color.parseColor("#CC1B5E20"));
             } else {
-                tv.setText("⚠️ PAUSED");
-                tv.setBackgroundColor(Color.parseColor("#CCD50000"));
+                mFloatingPill.setText("⚠️ PAUSED");
+                mFloatingPill.setBackgroundColor(Color.parseColor("#CCD50000"));
             }
         }
     }
