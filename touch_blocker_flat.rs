@@ -43,6 +43,12 @@ unsafe fn syscall4(nr: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> usi
     ret
 }
 
+unsafe fn syscall5(nr: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
+    let ret: usize;
+    asm!("svc #0", inout("x8") nr => _, inout("x0") a0 => ret, in("x1") a1, in("x2") a2, in("x3") a3, in("x4") a4, options(nostack));
+    ret
+}
+
 fn exit(code: usize) -> ! {
     unsafe { syscall1(93, code) }
 }
@@ -84,6 +90,14 @@ fn sleep_ms(ms: usize) {
     unsafe { syscall3(101, &ts as *const _ as usize, 0, 0); }
 }
 
+#[repr(C)]
+struct SockAddrIn {
+    sin_family: u16,
+    sin_port: u16,
+    sin_addr: u32,
+    sin_zero: [u8; 8],
+}
+
 const EVIOCGNAME_128: usize = 0x80804506;
 const EVIOCGPROP_8: usize = 0x80084509;
 const EVIOCGRAB: usize = 0x40044590;
@@ -106,7 +120,6 @@ pub unsafe extern "C" fn _start() -> ! {
         let n = syscall3(63, cfd as usize, arg_buf.as_mut_ptr() as usize, 255) as isize;
         syscall3(57, cfd as usize, 0, 0); // close
         if n > 0 {
-            // find first null byte
             let mut i = 0;
             while i < n as usize && arg_buf[i] != 0 { i += 1; }
             if i + 1 < n as usize {
@@ -120,8 +133,6 @@ pub unsafe extern "C" fn _start() -> ! {
                     cmd = b"on";
                 } else if bytes_match(arg, b"run") {
                     cmd = b"run";
-                } else if bytes_match(arg, b"daemon") || bytes_match(arg, b"-d") {
-                    cmd = b"daemon";
                 } else if bytes_match(arg, b"toggle") {
                     cmd = b"toggle";
                 } else if bytes_match(arg, b"help") || bytes_match(arg, b"-h") {
@@ -136,7 +147,7 @@ pub unsafe extern "C" fn _start() -> ! {
         print(b"Usage: touch_blocker [command]\n\n");
         print(b"Commands:\n");
         print(b"  status   Display detected input devices and current blocker state\n");
-        print(b"  on       Engage touchscreen blocking in background\n");
+        print(b"  on       Engage touchscreen blocking in background (true daemon)\n");
         print(b"  off      Disengage touchscreen blocking & restore touchscreen\n");
         print(b"  run      Run in foreground with real-time ghost touch counter\n");
         print(b"  toggle   Toggle blocking state\n");
@@ -162,13 +173,22 @@ pub unsafe extern "C" fn _start() -> ! {
         }
     }
 
+    // Check if the running_pid is actually alive (kill(pid, 0))
+    if running_pid > 0 {
+        let test_kill = syscall2(129, running_pid, 0) as isize;
+        if test_kill != 0 {
+            // Process does not exist anymore; stale PID file
+            running_pid = 0;
+            let _ = syscall3(35, -100isize as usize, PID_FILE.as_ptr() as usize, 0);
+        }
+    }
+
     if bytes_match(cmd, b"off") {
         if running_pid > 0 {
             print(b"[*] Stopping Touch Blocker daemon (PID: ");
             print_num(running_pid);
             print(b")...\n");
-            // send SIGTERM
-            let _ = syscall2(129, running_pid, 15);
+            let _ = syscall2(129, running_pid, 15); // SIGTERM
             let _ = syscall3(35, -100isize as usize, PID_FILE.as_ptr() as usize, 0); // unlink
             print(b"[OK] Touchscreen has been restored.\n");
         } else {
@@ -250,6 +270,7 @@ pub unsafe extern "C" fn _start() -> ! {
             print(b"ACTIVE [PID: ");
             print_num(running_pid);
             print(b"] - Touchscreen is BLOCKED, Mouse is ALLOWED\n");
+            print(b"  Web Control: http://127.0.0.1:9876\n");
         } else {
             print(b"INACTIVE - Touchscreen is unblocked\n");
         }
@@ -257,16 +278,16 @@ pub unsafe extern "C" fn _start() -> ! {
         exit(0);
     }
 
-    // Commands: on, run, daemon
     if running_pid > 0 {
         print(b"[*] Blocker is already ACTIVE (PID: ");
         print_num(running_pid);
         print(b").\n");
-        print(b"    To turn off, run: touch_blocker off\n");
+        print(b"    Web Control: http://127.0.0.1:9876\n");
+        print(b"    To turn off: touch_blocker off\n");
         exit(0);
     }
 
-    // Find touchscreen fds
+    // Identify touchscreen fd
     let mut ts_fds = [0usize; 4];
     let mut ts_count = 0;
     let mut path = *b"/dev/input/event00\0";
@@ -294,7 +315,6 @@ pub unsafe extern "C" fn _start() -> ! {
             }
 
             if (is_direct || sub_str(&name_buf[..nlen], b"ts")) && ts_count < 4 {
-                // Apply EVIOCGRAB
                 let grab_res = syscall3(29, fd as usize, EVIOCGRAB, 1) as isize;
                 if grab_res == 0 {
                     print(b"[+] Exclusively GRABBED ");
@@ -319,12 +339,163 @@ pub unsafe extern "C" fn _start() -> ! {
         exit(1);
     }
 
-    // Write PID file
-    let my_pid = getpid();
+    // Set up local HTTP server on 127.0.0.1:9876
+    let sfd = syscall3(198, 2, 1, 0) as isize; // socket(AF_INET=2, SOCK_STREAM=1, 0)
+    let mut server_fd = -1isize;
+    if sfd >= 0 {
+        // SO_REUSEADDR
+        let one = 1u32;
+        let _ = syscall5(208, sfd as usize, 1, 2, &one as *const _ as usize, 4);
+
+        let addr = SockAddrIn {
+            sin_family: 2,
+            sin_port: (9876u16).to_be(),
+            sin_addr: 0x7F000001u32.to_be(), // 127.0.0.1
+            sin_zero: [0; 8],
+        };
+        let bres = syscall3(200, sfd as usize, &addr as *const _ as usize, 16) as isize;
+        if bres == 0 {
+            let lres = syscall3(201, sfd as usize, 5, 0) as isize;
+            if lres == 0 {
+                server_fd = sfd;
+            }
+        }
+    }
+
+    let is_daemon = bytes_match(cmd, b"on");
+
+    if is_daemon {
+        // TRUE DAEMONIZATION: clone(SIGCHLD=17, 0, 0, 0, 0)
+        let child_pid = syscall5(220, 17, 0, 0, 0, 0) as isize;
+        if child_pid > 0 {
+            // Parent: write PID file with child_pid
+            write_pid(child_pid as usize);
+            print(b"----------------------------------------------------------\n");
+            print(b"[OK] Touchscreen digitizer is 100% BLOCKED.\n");
+            print(b"[OK] Mouse input is 100% ALLOWED and fully functional.\n");
+            print(b"[+] Web Control Server: http://127.0.0.1:9876\n");
+            print(b"[+] Daemon running in background (PID: ");
+            print_num(child_pid as usize);
+            print(b").\n");
+            print(b"[OK] You can now safely DISCONNECT the PC/USB cable!\n");
+            print(b"----------------------------------------------------------\n");
+            exit(0);
+        }
+
+        // Child process continues:
+        // setsid() = syscall 157
+        let _ = syscall5(157, 0, 0, 0, 0, 0);
+
+        // Redirect stdin, stdout, stderr to /dev/null
+        let null_fd = syscall4(56, -100isize as usize, b"/dev/null\0".as_ptr() as usize, O_RDWR, 0) as isize;
+        if null_fd >= 0 {
+            let _ = syscall3(24, null_fd as usize, 0, 0); // dup3 to stdin
+            let _ = syscall3(24, null_fd as usize, 1, 0); // dup3 to stdout
+            let _ = syscall3(24, null_fd as usize, 2, 0); // dup3 to stderr
+            if null_fd > 2 {
+                syscall3(57, null_fd as usize, 0, 0);
+            }
+        }
+    } else {
+        // Foreground ("run" mode)
+        let my_pid = getpid();
+        write_pid(my_pid);
+        print(b"----------------------------------------------------------\n");
+        print(b"[OK] Touchscreen digitizer is 100% BLOCKED.\n");
+        print(b"[OK] Mouse input is 100% ALLOWED and fully functional.\n");
+        print(b"[*] Running in foreground. Press Ctrl+C or run 'touch_blocker off'.\n");
+        print(b"----------------------------------------------------------\n");
+    }
+
+    // Main event loop
+    let mut ghost_count = 0usize;
+    let mut raw_buf = [0u8; 512];
+    let mut is_blocked = true;
+    let mut loop_count = 0usize;
+
+    loop {
+        // 1. Drain phantom touches from grabbed touchscreen fds
+        if is_blocked {
+            for j in 0..ts_count {
+                let fd = ts_fds[j];
+                let nr = syscall3(63, fd, raw_buf.as_mut_ptr() as usize, 512) as isize;
+                if nr > 0 {
+                    ghost_count += (nr as usize) / 24;
+                }
+            }
+        }
+
+        // 2. Accept and handle HTTP requests on 127.0.0.1:9876
+        if server_fd >= 0 {
+            // accept4(server_fd, NULL, NULL, SOCK_NONBLOCK=0x800) -> syscall 242
+            let client_fd = syscall4(242, server_fd as usize, 0, 0, 0x800) as isize;
+            if client_fd >= 0 {
+                let mut req_buf = [0u8; 256];
+                let rn = syscall3(63, client_fd as usize, req_buf.as_mut_ptr() as usize, 255) as isize;
+                if rn > 0 {
+                    let req = &req_buf[..rn as usize];
+                    if sub_str(req, b"/toggle") {
+                        if is_blocked {
+                            for j in 0..ts_count { syscall3(29, ts_fds[j], EVIOCGRAB, 0); }
+                            is_blocked = false;
+                        } else {
+                            for j in 0..ts_count { syscall3(29, ts_fds[j], EVIOCGRAB, 1); }
+                            is_blocked = true;
+                        }
+                    } else if sub_str(req, b"/off") {
+                        if is_blocked {
+                            for j in 0..ts_count { syscall3(29, ts_fds[j], EVIOCGRAB, 0); }
+                            is_blocked = false;
+                        }
+                    } else if sub_str(req, b"/on") {
+                        if !is_blocked {
+                            for j in 0..ts_count { syscall3(29, ts_fds[j], EVIOCGRAB, 1); }
+                            is_blocked = true;
+                        }
+                    }
+
+                    // Return HTML response
+                    send_http_response(client_fd as usize, is_blocked, ghost_count);
+                }
+                syscall3(57, client_fd as usize, 0, 0); // close client
+            }
+        }
+
+        sleep_ms(50);
+        loop_count += 1;
+
+        if !is_daemon && loop_count % 60 == 0 {
+            print(b"[*] Ghost touches blocked: ");
+            print_num(ghost_count);
+            print(b"\n");
+        }
+
+        // Check if PID file was removed (stop signal)
+        let chk = syscall4(56, -100isize as usize, PID_FILE.as_ptr() as usize, O_RDONLY, 0) as isize;
+        if chk < 0 {
+            break;
+        }
+        syscall3(57, chk as usize, 0, 0);
+    }
+
+    // Release all grabs
+    for j in 0..ts_count {
+        let fd = ts_fds[j];
+        syscall3(29, fd, EVIOCGRAB, 0);
+        syscall3(57, fd, 0, 0);
+    }
+    if server_fd >= 0 {
+        syscall3(57, server_fd as usize, 0, 0);
+    }
+    let _ = syscall3(35, -100isize as usize, PID_FILE.as_ptr() as usize, 0);
+    exit(0);
+}
+
+unsafe fn write_pid(pid: usize) {
     let wpfd = syscall4(56, -100isize as usize, PID_FILE.as_ptr() as usize, O_RDWR | O_CREAT | O_TRUNC, 0o666) as isize;
     if wpfd >= 0 {
         let mut pbuf = [0u8; 20];
-        let mut n = my_pid;
+        let mut n = pid;
         let mut idx = 20;
         if n == 0 {
             idx -= 1;
@@ -338,60 +509,43 @@ pub unsafe extern "C" fn _start() -> ! {
         }
         let len = 20 - idx;
         syscall3(64, wpfd as usize, pbuf.as_ptr().add(idx) as usize, len);
-        let nl = b"\n";
-        syscall3(64, wpfd as usize, nl.as_ptr() as usize, 1);
+        syscall3(64, wpfd as usize, b"\n".as_ptr() as usize, 1);
         syscall3(57, wpfd as usize, 0, 0);
     }
+}
 
-    print(b"----------------------------------------------------------\n");
-    print(b"[OK] Touchscreen digitizer is 100% BLOCKED.\n");
-    print(b"[OK] Mouse input is 100% ALLOWED and fully functional.\n");
-    print(b"[*] Discarding all phantom touchscreen events...\n");
-    print(b"----------------------------------------------------------\n");
+unsafe fn send_http_response(fd: usize, is_blocked: bool, ghost_count: usize) {
+    let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Touch Blocker</title><style>body{background:#121212;color:#fff;font-family:sans-serif;text-align:center;padding:20px}a{display:inline-block;padding:15px 30px;font-size:20px;font-weight:bold;text-decoration:none;border-radius:10px;margin:15px 0}.btn-on{background:#00C853;color:#fff}.btn-off{background:#D50000;color:#fff}.badge{display:inline-block;padding:8px 16px;border-radius:20px;font-weight:bold;margin:10px 0}.active{background:#1B5E20;color:#A5D6A7}.inactive{background:#B71C1C;color:#FFCDD2}</style></head><body><h1>Smart Touch Blocker</h1>";
+    syscall3(64, fd, header.as_ptr() as usize, header.len());
 
-    let mut ghost_count = 0usize;
-    let mut raw_buf = [0u8; 512];
-    let is_fg = bytes_match(cmd, b"run");
-    let mut loop_count = 0usize;
-
-    loop {
-        // Read from grabbed fds to drain phantom touches
-        for j in 0..ts_count {
-            let fd = ts_fds[j];
-            let nr = syscall3(63, fd, raw_buf.as_mut_ptr() as usize, 512) as isize;
-            if nr > 0 {
-                ghost_count += (nr as usize) / 24; // sizeof(struct input_event) on 64-bit = 24
-            }
-        }
-
-        sleep_ms(100);
-        loop_count += 1;
-
-        if is_fg && loop_count % 30 == 0 {
-            print(b"[*] Ghost touches blocked: ");
-            print_num(ghost_count);
-            print(b"\n");
-        }
-
-        // Check if PID file still exists
-        let chk = syscall4(56, -100isize as usize, PID_FILE.as_ptr() as usize, O_RDONLY, 0) as isize;
-        if chk < 0 {
-            print(b"[*] Stop signal received. Unblocking...\n");
-            break;
-        }
-        syscall3(57, chk as usize, 0, 0);
+    if is_blocked {
+        let msg = b"<div class='badge active'>&#x1F6E1; TOUCHSCREEN BLOCKED &middot; MOUSE ALLOWED</div><p>Malfunctioning digitizer ghost touches are completely blocked.</p><a class='btn-off' href='/off'>TURN OFF (RESTORE TOUCH)</a>";
+        syscall3(64, fd, msg.as_ptr() as usize, msg.len());
+    } else {
+        let msg = b"<div class='badge inactive'>&#x26A0; UNBLOCKED</div><p>Touchscreen digitizer is currently active.</p><a class='btn-on' href='/on'>TURN ON (BLOCK TOUCH)</a>";
+        syscall3(64, fd, msg.as_ptr() as usize, msg.len());
     }
 
-    // Release grab and restore touchscreen
-    for j in 0..ts_count {
-        let fd = ts_fds[j];
-        syscall3(29, fd, EVIOCGRAB, 0);
-        syscall3(57, fd, 0, 0);
-    }
-    let _ = syscall3(35, -100isize as usize, PID_FILE.as_ptr() as usize, 0);
+    let stats1 = b"<p style='color:#888'>Ghost touches blocked: ";
+    syscall3(64, fd, stats1.as_ptr() as usize, stats1.len());
 
-    print(b"[OK] Touchscreen digitizer unblocked and restored.\n");
-    exit(0);
+    let mut n = ghost_count;
+    let mut num_buf = [0u8; 20];
+    let mut idx = 20;
+    if n == 0 {
+        idx -= 1;
+        num_buf[idx] = b'0';
+    } else {
+        while n > 0 {
+            idx -= 1;
+            num_buf[idx] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+    }
+    syscall3(64, fd, num_buf.as_ptr().add(idx) as usize, 20 - idx);
+
+    let footer = b"</p><p><a style='font-size:14px;background:#333;color:#ccc;padding:8px 16px' href='/'>Refresh Status</a></p></body></html>";
+    syscall3(64, fd, footer.as_ptr() as usize, footer.len());
 }
 
 fn bytes_match(a: &[u8], b: &[u8]) -> bool {
