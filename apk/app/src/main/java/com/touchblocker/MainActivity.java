@@ -97,6 +97,7 @@ public class MainActivity extends Activity {
                     mainHandler.post(() -> updateUI(false, false, ""));
                 }
             } catch (Exception e) {
+                android.util.Log.e("TouchBlockerApp", "HTTP error", e);
                 mainHandler.post(() -> updateUI(false, false, ""));
             }
         });

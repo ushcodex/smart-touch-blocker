@@ -10,6 +10,7 @@
         android:label="Touch Blocker"
         android:icon="@drawable/ic_launcher"
         android:theme="@style/AppTheme"
+        android:usesCleartextTraffic="true"
         android:allowBackup="true">
 
         <activity
