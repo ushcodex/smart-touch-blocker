@@ -1,89 +1,189 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:gravity="center"
-    android:padding="24dp"
-    android:background="#121212">
-
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="🛡 Smart Touch Blocker"
-        android:textColor="#FFFFFF"
-        android:textSize="24sp"
-        android:textStyle="bold"
-        android:layout_marginBottom="8dp" />
-
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="Hardware-level touchscreen isolation\nMouse remains 100% functional"
-        android:textColor="#AAAAAA"
-        android:textSize="14sp"
-        android:gravity="center"
-        android:layout_marginBottom="32dp" />
+    android:background="#121212"
+    android:fillViewport="true">
 
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical"
-        android:gravity="center"
-        android:background="#1E1E1E"
-        android:padding="24dp"
-        android:layout_marginBottom="32dp">
+        android:gravity="center_horizontal"
+        android:padding="20dp">
 
         <TextView
-            android:id="@+id/tv_badge"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="CHECKING..."
+            android:text="🛡 Smart Touch Blocker"
             android:textColor="#FFFFFF"
+            android:textSize="22sp"
             android:textStyle="bold"
-            android:textSize="16sp"
-            android:paddingHorizontal="16dp"
-            android:paddingVertical="8dp"
-            android:background="#333333"
-            android:layout_marginBottom="16dp" />
+            android:layout_marginTop="8dp"
+            android:layout_marginBottom="4dp" />
 
         <TextView
-            android:id="@+id/tv_status_desc"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Connecting to daemon on 127.0.0.1:9876..."
-            android:textColor="#DDDDDD"
-            android:textSize="14sp"
-            android:gravity="center"
-            android:layout_marginBottom="16dp" />
-
-        <TextView
-            android:id="@+id/tv_ghost_count"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text=""
+            android:text="Kernel-Level Selective Input Isolation"
             android:textColor="#888888"
             android:textSize="13sp"
-            android:gravity="center" />
+            android:layout_marginBottom="20dp" />
+
+        <!-- Status Card -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="#1E1E1E"
+            android:padding="20dp"
+            android:layout_marginBottom="20dp">
+
+            <TextView
+                android:id="@+id/tv_badge"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center_horizontal"
+                android:text="CHECKING..."
+                android:textColor="#FFFFFF"
+                android:textStyle="bold"
+                android:textSize="14sp"
+                android:paddingHorizontal="16dp"
+                android:paddingVertical="6dp"
+                android:background="#333333"
+                android:layout_marginBottom="16dp" />
+
+            <TextView
+                android:id="@+id/tv_mouse_status"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="🖱 Mouse: Checking..."
+                android:textColor="#FFFFFF"
+                android:textSize="15sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="8dp" />
+
+            <TextView
+                android:id="@+id/tv_touch_status"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="🛡 Touchscreen: Checking..."
+                android:textColor="#FFFFFF"
+                android:textSize="15sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="8dp" />
+
+            <TextView
+                android:id="@+id/tv_mode_desc"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Auto-Sync Mode: Touchscreen is automatically blocked when mouse is connected and allowed when disconnected."
+                android:textColor="#AAAAAA"
+                android:textSize="13sp"
+                android:layout_marginBottom="12dp" />
+
+            <TextView
+                android:id="@+id/tv_ghost_count"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Ghost touches filtered: 0"
+                android:textColor="#4CAF50"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <!-- Dynamic Action Buttons -->
+        <Button
+            android:id="@+id/btn_auto"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:text="🔄 AUTO MODE (Follow Mouse)"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:backgroundTint="#1976D2"
+            android:textColor="#FFFFFF"
+            android:layout_marginBottom="12dp" />
+
+        <LinearLayout
+            android:id="@+id/layout_manual_buttons"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="12dp">
+
+            <Button
+                android:id="@+id/btn_force_block"
+                android:layout_width="0dp"
+                android:layout_height="50dp"
+                android:layout_weight="1"
+                android:text="🛡 BLOCK"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:backgroundTint="#2E7D32"
+                android:textColor="#FFFFFF"
+                android:layout_marginEnd="6dp" />
+
+            <Button
+                android:id="@+id/btn_force_unblock"
+                android:layout_width="0dp"
+                android:layout_height="50dp"
+                android:layout_weight="1"
+                android:text="⚠️ UNBLOCK"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:backgroundTint="#C62828"
+                android:textColor="#FFFFFF"
+                android:layout_marginStart="6dp" />
+        </LinearLayout>
+
+        <!-- Start Daemon Buttons (shown when stopped) -->
+        <LinearLayout
+            android:id="@+id/layout_start_daemon"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone"
+            android:layout_marginBottom="12dp">
+
+            <Button
+                android:id="@+id/btn_start_adb"
+                android:layout_width="match_parent"
+                android:layout_height="52dp"
+                android:text="⚡ START BLOCKER (Local Shell)"
+                android:textSize="15sp"
+                android:textStyle="bold"
+                android:backgroundTint="#00C853"
+                android:textColor="#FFFFFF"
+                android:layout_marginBottom="8dp" />
+
+            <Button
+                android:id="@+id/btn_start_termux"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:text="💻 START VIA TERMUX"
+                android:textSize="14sp"
+                android:backgroundTint="#333333"
+                android:textColor="#FFFFFF" />
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/btn_web_ui"
+            android:layout_width="match_parent"
+            android:layout_height="46dp"
+            android:text="🌐 Open Offline Web Control"
+            android:textSize="13sp"
+            android:backgroundTint="#262626"
+            android:textColor="#CCCCCC"
+            android:layout_marginBottom="10dp" />
+
+        <Button
+            android:id="@+id/btn_refresh"
+            android:layout_width="match_parent"
+            android:layout_height="44dp"
+            android:text="🔄 Refresh Status"
+            android:textSize="13sp"
+            android:backgroundTint="#1E1E1E"
+            android:textColor="#888888" />
+
     </LinearLayout>
-
-    <Button
-        android:id="@+id/btn_action"
-        android:layout_width="match_parent"
-        android:layout_height="60dp"
-        android:text="TOGGLE BLOCKER"
-        android:textSize="18sp"
-        android:textStyle="bold"
-        android:backgroundTint="#00C853"
-        android:layout_marginBottom="16dp" />
-
-    <Button
-        android:id="@+id/btn_refresh"
-        android:layout_width="match_parent"
-        android:layout_height="48dp"
-        android:text="🔄 Refresh Status"
-        android:textSize="14sp"
-        android:backgroundTint="#333333"
-        android:textColor="#CCCCCC" />
-
-</LinearLayout>
+</ScrollView>
