@@ -35,3 +35,6 @@ test_arm64*
 test_cmdline_arm64*
 test_entry_arm64*
 test_main_arm64*
+
+test_daemon_arm64
+test_sock_arm64

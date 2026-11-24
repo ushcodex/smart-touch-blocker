@@ -339,8 +339,8 @@ pub unsafe extern "C" fn _start() -> ! {
         exit(1);
     }
 
-    // Set up local HTTP server on 127.0.0.1:9876
-    let sfd = syscall3(198, 2, 1, 0) as isize; // socket(AF_INET=2, SOCK_STREAM=1, 0)
+    // Set up local HTTP server on 127.0.0.1:9876 (SOCK_STREAM | SOCK_NONBLOCK = 1 | 0x800)
+    let sfd = syscall3(198, 2, 1 | 0x800, 0) as isize;
     let mut server_fd = -1isize;
     if sfd >= 0 {
         // SO_REUSEADDR
@@ -427,9 +427,13 @@ pub unsafe extern "C" fn _start() -> ! {
 
         // 2. Accept and handle HTTP requests on 127.0.0.1:9876
         if server_fd >= 0 {
-            // accept4(server_fd, NULL, NULL, SOCK_NONBLOCK=0x800) -> syscall 242
-            let client_fd = syscall4(242, server_fd as usize, 0, 0, 0x800) as isize;
+            // accept4(server_fd, NULL, NULL, 0) -> non-blocking accept because server_fd has SOCK_NONBLOCK
+            let client_fd = syscall4(242, server_fd as usize, 0, 0, 0) as isize;
             if client_fd >= 0 {
+                // Set 1-second receive timeout on client_fd (SO_RCVTIMEO = 20)
+                let rcv_to = TimeSpec { tv_sec: 1, tv_nsec: 0 };
+                let _ = syscall5(208, client_fd as usize, 1, 20, &rcv_to as *const _ as usize, 16);
+
                 let mut req_buf = [0u8; 256];
                 let rn = syscall3(63, client_fd as usize, req_buf.as_mut_ptr() as usize, 255) as isize;
                 if rn > 0 {
