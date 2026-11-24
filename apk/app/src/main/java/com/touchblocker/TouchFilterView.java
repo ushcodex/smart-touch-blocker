@@ -85,7 +85,7 @@ public class TouchFilterView extends View {
     @Override
     public boolean onGenericMotionEvent(MotionEvent event) {
         // Mouse hover/scroll events — always pass through
-        if (MotionEvent.isFromSource(event, InputDevice.SOURCE_MOUSE)) {
+        if (event.isFromSource(InputDevice.SOURCE_MOUSE)) {
             int buttons = event.getButtonState();
             if (buttons != 0 && !mMousePassthrough) {
                 // Button state changed in a hover event — preemptively open the passthrough
