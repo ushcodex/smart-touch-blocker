@@ -1,0 +1,31 @@
+# Compiled binaries
+touch_blocker_arm64
+touch_blocker_flat_arm64
+test_grab_arm64
+scan_devices_arm64
+*.apk
+
+# Android build outputs
+apk/app/build/
+apk/.gradle/
+apk/local.properties
+
+# Gradle caches
+.gradle/
+
+# Android Studio / IDE
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Rust
+target/
+
+# Logs
+*.log
+
+*.o
+*.rcgu.o
