@@ -25,7 +25,7 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Kernel-Level Selective Input Isolation"
+            android:text="Kernel Isolation + Overlay-Free Reboot Fallback"
             android:textColor="#888888"
             android:textSize="13sp"
             android:layout_marginBottom="20dp" />
@@ -92,7 +92,7 @@
                 android:textStyle="bold" />
         </LinearLayout>
 
-        <!-- Dynamic Action Buttons -->
+        <!-- Dynamic Action Buttons (Kernel Daemon OR Fallback Mode) -->
         <Button
             android:id="@+id/btn_auto"
             android:layout_width="match_parent"
@@ -136,7 +136,19 @@
                 android:layout_marginStart="6dp" />
         </LinearLayout>
 
-        <!-- Start Daemon Buttons (shown when stopped) -->
+        <!-- Enable Reboot Fallback Button (shown when Accessibility fallback is not yet enabled) -->
+        <Button
+            android:id="@+id/btn_enable_fallback"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:text="⚙️ ENABLE REBOOT FALLBACK (No PC)"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:backgroundTint="#E65100"
+            android:textColor="#FFFFFF"
+            android:layout_marginBottom="12dp" />
+
+        <!-- Start Daemon Buttons (shown when daemon is stopped) -->
         <LinearLayout
             android:id="@+id/layout_start_daemon"
             android:layout_width="match_parent"
@@ -148,22 +160,13 @@
             <Button
                 android:id="@+id/btn_start_adb"
                 android:layout_width="match_parent"
-                android:layout_height="52dp"
-                android:text="⚡ START BLOCKER (Local Shell)"
-                android:textSize="15sp"
+                android:layout_height="48dp"
+                android:text="⚡ START KERNEL DAEMON (Local Shell)"
+                android:textSize="14sp"
                 android:textStyle="bold"
                 android:backgroundTint="#00C853"
                 android:textColor="#FFFFFF"
                 android:layout_marginBottom="8dp" />
-
-            <Button
-                android:id="@+id/btn_start_termux"
-                android:layout_width="match_parent"
-                android:layout_height="48dp"
-                android:text="💻 START VIA TERMUX"
-                android:textSize="14sp"
-                android:backgroundTint="#333333"
-                android:textColor="#FFFFFF" />
         </LinearLayout>
 
         <Button
