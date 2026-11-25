@@ -46,7 +46,7 @@ public class MainActivity extends Activity {
         @Override
         public void run() {
             refreshStatusAsync();
-            mainHandler.postDelayed(this, 1200);
+            mainHandler.postDelayed(this, 800);
         }
     };
 
@@ -78,7 +78,7 @@ public class MainActivity extends Activity {
         btnForceUnblock.setOnClickListener(v -> handleModeSwitch(TouchExplorerFallbackService.MODE_FORCE_UNBLOCK, "/off", "Touchscreen Restored"));
 
         btnEnableFallback.setOnClickListener(v -> {
-            Toast.makeText(this, "Enable 'Touch Blocker' under Accessibility (No overlay — safe for mouse!)", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "Enable 'Touch Blocker' under Accessibility", Toast.LENGTH_LONG).show();
             startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
         });
 
@@ -118,137 +118,124 @@ public class MainActivity extends Activity {
         });
     }
 
-    private void handleModeSwitch(int fallbackMode, String daemonEndpoint, String successMsg) {
+    private void handleModeSwitch(int mode, String daemonEndpoint, String successMsg) {
         if (mLastDaemonRunning) {
             executor.execute(() -> {
                 boolean ok = DaemonClient.sendAction(daemonEndpoint);
                 mainHandler.post(() -> {
-                    Toast.makeText(this, ok ? successMsg : "Failed to connect to daemon", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, ok ? successMsg : "Failed to reach daemon", Toast.LENGTH_SHORT).show();
                     refreshStatusAsync();
                 });
             });
         } else {
-            TouchExplorerFallbackService fallback = TouchExplorerFallbackService.getInstance();
-            if (fallback != null) {
-                fallback.setMode(fallbackMode);
-                Toast.makeText(this, successMsg + " (Fallback Mode)", Toast.LENGTH_SHORT).show();
+            TouchExplorerFallbackService svc = TouchExplorerFallbackService.getInstance();
+            if (svc != null) {
+                svc.setMode(mode);
+                Toast.makeText(this, successMsg, Toast.LENGTH_SHORT).show();
                 refreshStatusAsync();
             } else {
-                Toast.makeText(this, "Enable Reboot Fallback in Accessibility first", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "Enable Touch Blocker in Accessibility first", Toast.LENGTH_SHORT).show();
             }
         }
     }
 
     private void startDaemonViaLocalAdb() {
-        Toast.makeText(this, "Trying local ADB shell (127.0.0.1:5555)...", Toast.LENGTH_SHORT).show();
         executor.execute(() -> {
             boolean ok = AdbLocalClient.executeCommand("/data/local/tmp/touch_blocker on");
-            try { Thread.sleep(500); } catch (Exception ignored) {}
+            try { Thread.sleep(400); } catch (Exception ignored) {}
             mainHandler.post(() -> {
-                if (ok) {
-                    Toast.makeText(this, "Kernel daemon started!", Toast.LENGTH_SHORT).show();
-                } else {
-                    Toast.makeText(this, "Port 5555 closed after reboot. Using Reboot Fallback instead.", Toast.LENGTH_LONG).show();
-                }
+                Toast.makeText(this, ok ? "Kernel daemon started!" : "Local ADB unavailable (using Spotlight mode)", Toast.LENGTH_SHORT).show();
                 refreshStatusAsync();
             });
         });
     }
 
     private void updateUI(DaemonClient.DaemonStatus status) {
-        TouchExplorerFallbackService fallback = TouchExplorerFallbackService.getInstance();
-        boolean fallbackReady = (fallback != null);
+        TouchExplorerFallbackService spotlight = TouchExplorerFallbackService.getInstance();
+        boolean spotlightReady = (spotlight != null);
 
-        // Show one-tap setup button whenever Accessibility fallback isn't enabled yet
-        btnEnableFallback.setVisibility(fallbackReady ? View.GONE : View.VISIBLE);
+        btnEnableFallback.setVisibility(spotlightReady ? View.GONE : View.VISIBLE);
 
         if (status.isRunning) {
-            // ── MODE 1: KERNEL DAEMON (100% hardware block) ──────────────────
             tvBadge.setText("🛡️ KERNEL DAEMON ACTIVE");
             tvBadge.setBackgroundColor(Color.parseColor("#1B5E20"));
 
             setMouseText(status.isMouseConnected);
 
             if (status.isBlocked) {
-                tvTouchStatus.setText("🛡️ Touchscreen: BLOCKED (Kernel EVIOCGRAB)");
+                tvTouchStatus.setText("🛡️ Touchscreen: BLOCKED (Kernel)");
                 tvTouchStatus.setTextColor(Color.parseColor("#69F0AE"));
             } else {
-                tvTouchStatus.setText("⚠️ Touchscreen: ALLOWED (Active)");
+                tvTouchStatus.setText("⚠️ Touchscreen: ALLOWED");
                 tvTouchStatus.setTextColor(Color.parseColor("#FFD54F"));
             }
 
-            if (status.isAutoMode) {
-                tvModeDesc.setText("⚙️ Auto-Sync ACTIVE: Blocks touch when mouse connects, restores touch when disconnected."
-                        + (fallbackReady ? "\n✓ Reboot Fallback armed for restarts." : ""));
-                btnAuto.setText("✓ AUTO-SYNC ACTIVE");
-                btnAuto.setBackgroundColor(Color.parseColor("#0D47A1"));
-            } else {
-                tvModeDesc.setText("⚙️ MANUAL OVERRIDE: Tap Auto Mode below to re-enable automatic mouse sync.");
-                btnAuto.setText("🔄 SWITCH TO AUTO MODE");
-                btnAuto.setBackgroundColor(Color.parseColor("#1976D2"));
-            }
+            tvModeDesc.setText(status.isAutoMode
+                    ? "Auto-Sync ACTIVE: Blocks touch when mouse connects, restores when disconnected."
+                    : "MANUAL OVERRIDE: Tap Auto Mode to sync with mouse.");
+            btnAuto.setText(status.isAutoMode ? "✓ AUTO-SYNC ACTIVE" : "🔄 SWITCH TO AUTO MODE");
+            btnAuto.setBackgroundColor(Color.parseColor(status.isAutoMode ? "#0D47A1" : "#1976D2"));
 
-            tvGhostCount.setText("Ghost touches filtered: " + status.ghostCount);
+            tvGhostCount.setText("Ghost touches blocked: " + status.ghostCount);
 
             layoutManualButtons.setVisibility(View.VISIBLE);
             btnAuto.setVisibility(View.VISIBLE);
             layoutStartDaemon.setVisibility(View.GONE);
             btnWebUi.setVisibility(View.VISIBLE);
 
-        } else if (fallbackReady) {
-            // ── MODE 2: OVERLAY-FREE REBOOT FALLBACK (No PC needed!) ─────────
+        } else if (spotlightReady) {
             boolean mouseNow = TouchExplorerFallbackService.detectMouse(this);
-            boolean active = fallback.isTouchExplorationActive();
-            int mode = fallback.getMode();
+            boolean blocking = spotlight.isBlockingActive();
+            int mode = spotlight.getMode();
 
-            tvBadge.setText("🛡️ REBOOT FALLBACK ACTIVE (NO PC)");
-            tvBadge.setBackgroundColor(Color.parseColor("#00695C"));
-
-            setMouseText(mouseNow);
-
-            if (active) {
-                tvTouchStatus.setText("🛡️ Touchscreen: NEUTRALIZED (Mouse Native)");
+            if (blocking) {
+                tvBadge.setText("🛡️ SPOTLIGHT BLOCKER ACTIVE (NO PC)");
+                tvBadge.setBackgroundColor(Color.parseColor("#1B5E20"));
+                tvTouchStatus.setText("🛡️ Touchscreen: BLOCKED (Mouse Spotlight Hole)");
                 tvTouchStatus.setTextColor(Color.parseColor("#69F0AE"));
             } else {
-                tvTouchStatus.setText("⚠️ Touchscreen: ALLOWED (Active)");
+                tvBadge.setText("⚠️ STANDBY (TOUCH ALLOWED)");
+                tvBadge.setBackgroundColor(Color.parseColor("#E65100"));
+                tvTouchStatus.setText("⚠️ Touchscreen: ALLOWED (No overlays)");
                 tvTouchStatus.setTextColor(Color.parseColor("#FFD54F"));
             }
 
+            setMouseText(mouseNow);
+
             if (mode == TouchExplorerFallbackService.MODE_AUTO) {
-                tvModeDesc.setText("⚙️ Overlay-Free Fallback (Auto-Sync): Neutralizes ghost taps when mouse is connected while keeping mouse 100% native. Survives reboots without PC!");
+                tvModeDesc.setText("Auto-Sync ACTIVE: Covers 99.9% of screen against ghost touches while keeping a live windowless hole under your mouse cursor.");
                 btnAuto.setText("✓ AUTO-SYNC ACTIVE");
                 btnAuto.setBackgroundColor(Color.parseColor("#0D47A1"));
             } else {
-                tvModeDesc.setText("⚙️ Fallback MANUAL OVERRIDE: Tap Auto Mode to sync with Bluetooth mouse.");
+                tvModeDesc.setText("MANUAL OVERRIDE: Tap Auto Mode to sync with Bluetooth mouse.");
                 btnAuto.setText("🔄 SWITCH TO AUTO MODE");
                 btnAuto.setBackgroundColor(Color.parseColor("#1976D2"));
             }
 
-            tvGhostCount.setText("Ghost events neutralized: " + fallback.getNeutralizedCount());
+            tvGhostCount.setText("Real ghost touches absorbed: " + spotlight.getBlockedGhostCount());
 
             layoutManualButtons.setVisibility(View.VISIBLE);
             btnAuto.setVisibility(View.VISIBLE);
-            layoutStartDaemon.setVisibility(View.VISIBLE);
+            layoutStartDaemon.setVisibility(View.GONE);
             btnWebUi.setVisibility(View.GONE);
 
         } else {
-            // ── MODE 3: NEITHER DAEMON NOR FALLBACK ACTIVE ───────────────────
             boolean mouseNow = TouchExplorerFallbackService.detectMouse(this);
 
-            tvBadge.setText("⚠️ PROTECTION INACTIVE");
+            tvBadge.setText("⚠️ SERVICE NOT ENABLED");
             tvBadge.setBackgroundColor(Color.parseColor("#B71C1C"));
 
             setMouseText(mouseNow);
 
-            tvTouchStatus.setText("⚠️ Touchscreen: Unblocked (Native)");
+            tvTouchStatus.setText("⚠️ Touchscreen: Unblocked");
             tvTouchStatus.setTextColor(Color.parseColor("#AAAAAA"));
 
-            tvModeDesc.setText("Kernel daemon stopped after reboot.\n\nTap 'ENABLE REBOOT FALLBACK' below so the app automatically protects your phone after every reboot without needing a PC.");
+            tvModeDesc.setText("Tap 'ENABLE REBOOT FALLBACK' below to activate standalone touch blocking without a PC.");
             tvGhostCount.setText("");
 
             layoutManualButtons.setVisibility(View.GONE);
             btnAuto.setVisibility(View.GONE);
-            layoutStartDaemon.setVisibility(View.VISIBLE);
+            layoutStartDaemon.setVisibility(View.GONE);
             btnWebUi.setVisibility(View.GONE);
         }
     }
