@@ -18,23 +18,26 @@ import android.view.Gravity;
 import android.view.InputDevice;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 
 /**
- * 4-Window Predictive Mouse Spotlight Blocker (v3.3 - 100% Standalone, Zero PC/ADB).
+ * 4-Window Predictive Mouse Spotlight Blocker (v3.4 - 100% Standalone, Zero PC/ADB).
  *
  * Places 4 transparent touch-absorbing strips (Top, Bottom, Left, Right) around a
- * dynamic windowless "spotlight hole" that tracks and leads the Bluetooth mouse cursor:
+ * dynamic windowless "spotlight hole" that tracks the Bluetooth/USB mouse cursor:
  *
- * - Resting hole: 72x72 px (blocks 99.8% of the screen against ghost touches).
- * - Fast flicks: Predictive velocity lead + temporary expansion up to 192x192 px
- *   so rapid flicks and swipes always land inside the native windowless hole.
- * - Edge-catch safety net: If a fast mouse click or swipe still catches a strip edge
- *   mid-frame, its exact Path is recorded and immediately replayed via dispatchGesture
- *   so fast gestures never drop.
- * - Auto-Mouse Sync: Detaches all strips when the Bluetooth mouse disconnects
- *   (restoring normal finger touch) and re-attaches them when it reconnects.
+ * - Resting hole: 128x128 px (blocks 99.3% of the screen against ghost touches).
+ * - Moving hole: Smoothly expands up to 240x240 px with bounded velocity lead and
+ *   frame-paced diffed WindowManager updates (no IPC backlog).
+ * - Always recenters on the actual cursor stop position when shrinking.
+ * - Caught taps & long-presses: Immediately opens the hole on ACTION_DOWN and replays
+ *   cleanly through the open hole once committed (zero pass-through race).
+ * - Caught swipes & edge gestures: Waits for InputDispatcher pass-through commit before
+ *   replaying a downsampled, screen-clamped Path with preserved duration, then atomically
+ *   restores strips centered on the release point.
+ * - Auto-Mouse Sync: Detaches all strips when the mouse disconnects and re-attaches on connect.
  */
 public class TouchExplorerFallbackService extends AccessibilityService
         implements InputManager.InputDeviceListener {
@@ -45,18 +48,30 @@ public class TouchExplorerFallbackService extends AccessibilityService
     public static final int MODE_FORCE_BLOCK = 1;
     public static final int MODE_FORCE_UNBLOCK = 2;
 
-    private static final int BASE_HOLE_RADIUS_PX = 36;  // 72x72 px resting
-    private static final int FAST_HOLE_RADIUS_PX = 96;  // 192x192 px during fast movement
-    private static final long SHRINK_DELAY_MS = 180;
+    private static final int BASE_HOLE_RADIUS_PX = 64;   // 128x128 px resting (~0.65% of screen)
+    private static final int FAST_HOLE_RADIUS_PX = 120;  // 240x240 px during movement/clicks
+    private static final long SHRINK_DELAY_MS = 220;
+    private static final long HOVER_THROTTLE_MS = 16;    // Max 1 layout update per 60Hz frame
+    private static final long PASS_THROUGH_COMMIT_MS = 65; // Guaranteed InputDispatcher sync
+    private static final long TAP_DURATION_MS = 50;
+    private static final long LONG_PRESS_THRESHOLD_MS = 450;
+    private static final float PATH_MIN_SEGMENT_PX = 8f;
 
     private static volatile TouchExplorerFallbackService sInstance = null;
 
     private WindowManager mWindowManager;
     private InputManager mInputManager;
     private final Handler mHandler = new Handler(Looper.getMainLooper());
+    private int mTouchSlop = 24;
 
     private final View[] mStrips = new View[4]; // 0=Top, 1=Bottom, 2=Left, 3=Right
     private final WindowManager.LayoutParams[] mParams = new WindowManager.LayoutParams[4];
+    private final int[] mAppliedX = new int[4];
+    private final int[] mAppliedY = new int[4];
+    private final int[] mAppliedW = new int[4];
+    private final int[] mAppliedH = new int[4];
+    private final int[] mAppliedFlags = new int[4];
+
     private boolean mStripsAttached = false;
     private boolean mStripsTemporarilyPassThrough = false;
 
@@ -66,26 +81,50 @@ public class TouchExplorerFallbackService extends AccessibilityService
     private int mHoleY = 1155;
     private int mCurrentRadius = BASE_HOLE_RADIUS_PX;
 
-    // Velocity tracking for predictive hole lead
+    // Velocity & frame-paced hover tracking
     private float mLastHoverX = -1;
     private float mLastHoverY = -1;
     private long mLastHoverTime = 0;
+    private long mLastLayoutUpdateTime = 0;
+    private boolean mHoverUpdateScheduled = false;
+    private int mPendingHoleX = 540;
+    private int mPendingHoleY = 1155;
+    private int mPendingHoleRadius = BASE_HOLE_RADIUS_PX;
 
-    // Edge-caught mouse gesture recording (for ultra-fast flick-swipes)
+    // Edge-caught mouse gesture recording
     private boolean mRecordingMouseGesture = false;
+    private int mCaughtDeviceId = -1;
     private Path mCaughtGesturePath = null;
     private long mCaughtGestureStartTime = 0;
+    private long mHoleOpenedAtCaughtPosTime = 0;
     private float mCaughtStartX = 0;
     private float mCaughtStartY = 0;
+    private float mCaughtLastPathX = 0;
+    private float mCaughtLastPathY = 0;
+    private float mCaughtMaxDist = 0;
+
+    // Cancellable replay runnables (prevents stale timers clobbering back-to-back gestures)
+    private Runnable mPendingDispatchRunnable = null;
+    private Runnable mRestoreTouchRunnable = null;
+    private int mSwipeEndX = 540;
+    private int mSwipeEndY = 1155;
 
     private volatile int mMode = MODE_AUTO;
     private volatile boolean mMouseConnected = false;
     private volatile long mBlockedGhostCount = 0;
 
+    private final Runnable mPendingHoverRunnable = () -> {
+        mHoverUpdateScheduled = false;
+        if (mStripsAttached && !mStripsTemporarilyPassThrough && !mRecordingMouseGesture) {
+            applyHoleLayout(mPendingHoleX, mPendingHoleY, mPendingHoleRadius, false);
+        }
+    };
+
     private final Runnable mShrinkHoleRunnable = () -> {
-        if (mStripsAttached && mCurrentRadius != BASE_HOLE_RADIUS_PX) {
-            mCurrentRadius = BASE_HOLE_RADIUS_PX;
-            applyHoleLayout(mHoleX, mHoleY, mCurrentRadius);
+        if (mStripsAttached && !mStripsTemporarilyPassThrough && !mRecordingMouseGesture) {
+            int cx = (mLastHoverX >= 0) ? (int) mLastHoverX : mHoleX;
+            int cy = (mLastHoverY >= 0) ? (int) mLastHoverY : mHoleY;
+            applyHoleLayout(cx, cy, BASE_HOLE_RADIUS_PX, false);
         }
     };
 
@@ -147,6 +186,7 @@ public class TouchExplorerFallbackService extends AccessibilityService
         sInstance = this;
         mWindowManager = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
         mInputManager = (InputManager) getSystemService(Context.INPUT_SERVICE);
+        mTouchSlop = Math.max(16, ViewConfiguration.get(this).getScaledTouchSlop());
 
         updateScreenSize();
         mHoleX = mScreenW / 2;
@@ -158,7 +198,8 @@ public class TouchExplorerFallbackService extends AccessibilityService
 
         mMouseConnected = detectMouse(this);
         syncOverlayState();
-        Log.i(TAG, "Predictive 4-Window Spotlight connected. Mouse=" + mMouseConnected + ", Active=" + mStripsAttached);
+        Log.i(TAG, "Predictive 4-Window Spotlight v3.4 connected. Mouse=" + mMouseConnected
+                + ", Active=" + mStripsAttached + ", TouchSlop=" + mTouchSlop);
     }
 
     @Override
@@ -166,13 +207,15 @@ public class TouchExplorerFallbackService extends AccessibilityService
         super.onConfigurationChanged(newConfig);
         updateScreenSize();
         if (mStripsAttached) {
-            applyHoleLayout(mScreenW / 2, mScreenH / 2, BASE_HOLE_RADIUS_PX);
+            mLastHoverX = mScreenW / 2f;
+            mLastHoverY = mScreenH / 2f;
+            applyHoleLayout(mScreenW / 2, mScreenH / 2, BASE_HOLE_RADIUS_PX, true);
         }
     }
 
     @Override
     public void onDestroy() {
-        mHandler.removeCallbacks(mShrinkHoleRunnable);
+        cancelAllPendingRunnables();
         if (mInputManager != null) {
             try {
                 mInputManager.unregisterInputDeviceListener(this);
@@ -199,6 +242,20 @@ public class TouchExplorerFallbackService extends AccessibilityService
     public void onInputDeviceChanged(int deviceId) {
         mMouseConnected = detectMouse(this);
         syncOverlayState();
+    }
+
+    private void cancelAllPendingRunnables() {
+        mHandler.removeCallbacks(mShrinkHoleRunnable);
+        mHandler.removeCallbacks(mPendingHoverRunnable);
+        mHoverUpdateScheduled = false;
+        if (mPendingDispatchRunnable != null) {
+            mHandler.removeCallbacks(mPendingDispatchRunnable);
+            mPendingDispatchRunnable = null;
+        }
+        if (mRestoreTouchRunnable != null) {
+            mHandler.removeCallbacks(mRestoreTouchRunnable);
+            mRestoreTouchRunnable = null;
+        }
     }
 
     private void updateScreenSize() {
@@ -241,8 +298,10 @@ public class TouchExplorerFallbackService extends AccessibilityService
         try {
             for (int i = 0; i < 4; i++) {
                 mWindowManager.addView(mStrips[i], mParams[i]);
+                recordApplied(i);
             }
             mStripsAttached = true;
+            mLastLayoutUpdateTime = SystemClock.uptimeMillis();
             Log.i(TAG, "4-Window Mouse Spotlight ATTACHED (" + mScreenW + "x" + mScreenH + ")");
         } catch (Exception e) {
             Log.e(TAG, "Failed to attach spotlight strips: " + e.getMessage());
@@ -251,7 +310,7 @@ public class TouchExplorerFallbackService extends AccessibilityService
     }
 
     private void detachStrips() {
-        mHandler.removeCallbacks(mShrinkHoleRunnable);
+        cancelAllPendingRunnables();
         if (mWindowManager != null) {
             for (int i = 0; i < 4; i++) {
                 if (mStrips[i] != null) {
@@ -265,6 +324,8 @@ public class TouchExplorerFallbackService extends AccessibilityService
         }
         mStripsAttached = false;
         mStripsTemporarilyPassThrough = false;
+        mRecordingMouseGesture = false;
+        mCaughtGesturePath = null;
     }
 
     private View createStripView() {
@@ -275,7 +336,8 @@ public class TouchExplorerFallbackService extends AccessibilityService
                     return false;
                 }
 
-                if (isMouseEvent(event)) {
+                if (isMouseEvent(event)
+                        || (mRecordingMouseGesture && event.getDeviceId() == mCaughtDeviceId)) {
                     handleCaughtMouseTouch(event);
                     return true;
                 }
@@ -290,9 +352,13 @@ public class TouchExplorerFallbackService extends AccessibilityService
             @Override
             public boolean onGenericMotionEvent(MotionEvent event) {
                 int action = event.getActionMasked();
-                if ((action == MotionEvent.ACTION_HOVER_MOVE || action == MotionEvent.ACTION_HOVER_ENTER)
+                if ((action == MotionEvent.ACTION_HOVER_MOVE
+                        || action == MotionEvent.ACTION_HOVER_ENTER
+                        || action == MotionEvent.ACTION_SCROLL)
                         && isMouseEvent(event)) {
-                    handleMouseHover(event.getRawX(), event.getRawY());
+                    boolean urgent = (action == MotionEvent.ACTION_HOVER_ENTER
+                            || action == MotionEvent.ACTION_SCROLL);
+                    handleMouseHover(event.getRawX(), event.getRawY(), urgent);
                 }
                 return false;
             }
@@ -301,117 +367,281 @@ public class TouchExplorerFallbackService extends AccessibilityService
         return v;
     }
 
-    private void handleMouseHover(float rawX, float rawY) {
+    private void handleMouseHover(float rawX, float rawY, boolean urgent) {
+        if (mStripsTemporarilyPassThrough || mRecordingMouseGesture) return;
+
         long now = SystemClock.uptimeMillis();
-        int targetX = (int) rawX;
-        int targetY = (int) rawY;
+        float clampedX = clampX(rawX);
+        float clampedY = clampY(rawY);
+        int targetX = (int) clampedX;
+        int targetY = (int) clampedY;
         int targetRadius = BASE_HOLE_RADIUS_PX;
 
         if (mLastHoverTime > 0) {
             long dt = now - mLastHoverTime;
             if (dt > 0 && dt < 120) {
-                float dx = rawX - mLastHoverX;
-                float dy = rawY - mLastHoverY;
+                float dx = clampedX - mLastHoverX;
+                float dy = clampedY - mLastHoverY;
                 float dist = (float) Math.hypot(dx, dy);
                 float speedPxPerMs = dist / dt;
 
-                if (speedPxPerMs > 0.6f) {
-                    // Fast mouse movement: expand hole & predict slightly ahead
-                    float factor = Math.min(1.0f, (speedPxPerMs - 0.6f) / 2.4f);
-                    targetRadius = (int) (BASE_HOLE_RADIUS_PX + factor * (FAST_HOLE_RADIUS_PX - BASE_HOLE_RADIUS_PX));
-                    // Lead ~18ms ahead along motion vector, clamped to stay inside hole
-                    int leadX = (int) Math.max(-targetRadius / 2f, Math.min(targetRadius / 2f, (dx / dt) * 18f));
-                    int leadY = (int) Math.max(-targetRadius / 2f, Math.min(targetRadius / 2f, (dy / dt) * 18f));
+                if (speedPxPerMs > 0.5f) {
+                    float factor = Math.min(1.0f, (speedPxPerMs - 0.5f) / 2.2f);
+                    targetRadius = (int) (BASE_HOLE_RADIUS_PX
+                            + factor * (FAST_HOLE_RADIUS_PX - BASE_HOLE_RADIUS_PX));
+                    // Keep actual cursor well inside the inner 2/3 of the hole
+                    float maxLead = targetRadius / 3f;
+                    int leadX = (int) Math.max(-maxLead, Math.min(maxLead, (dx / dt) * 14f));
+                    int leadY = (int) Math.max(-maxLead, Math.min(maxLead, (dy / dt) * 14f));
                     targetX += leadX;
                     targetY += leadY;
                 }
             }
         }
 
-        mLastHoverX = rawX;
-        mLastHoverY = rawY;
+        // Always remember the exact un-leaded cursor position for shrinking/recentering
+        mLastHoverX = clampedX;
+        mLastHoverY = clampedY;
         mLastHoverTime = now;
 
-        mCurrentRadius = targetRadius;
-        applyHoleLayout(targetX, targetY, targetRadius);
-
-        if (targetRadius > BASE_HOLE_RADIUS_PX) {
-            mHandler.removeCallbacks(mShrinkHoleRunnable);
-            mHandler.postDelayed(mShrinkHoleRunnable, SHRINK_DELAY_MS);
+        long sinceLastUpdate = now - mLastLayoutUpdateTime;
+        if (urgent || sinceLastUpdate >= HOVER_THROTTLE_MS) {
+            mHandler.removeCallbacks(mPendingHoverRunnable);
+            mHoverUpdateScheduled = false;
+            applyHoleLayout(targetX, targetY, targetRadius, false);
+        } else {
+            mPendingHoleX = targetX;
+            mPendingHoleY = targetY;
+            mPendingHoleRadius = targetRadius;
+            if (!mHoverUpdateScheduled) {
+                mHoverUpdateScheduled = true;
+                mHandler.postDelayed(mPendingHoverRunnable, HOVER_THROTTLE_MS - sinceLastUpdate);
+            }
         }
+
+        // Always recenter and shrink back to the actual cursor position once movement stops
+        mHandler.removeCallbacks(mShrinkHoleRunnable);
+        mHandler.postDelayed(mShrinkHoleRunnable, SHRINK_DELAY_MS);
     }
 
     /**
-     * Safety net: if a super-fast mouse flick+press/swipe lands on a strip edge before
-     * the hole finishes moving, record the exact gesture Path and replay it natively.
+     * Handles mouse clicks, long-presses, and swipes that land on a strip edge
+     * (e.g. immediately after a previous swipe or an ultra-fast flick).
      */
     private void handleCaughtMouseTouch(MotionEvent event) {
         int action = event.getActionMasked();
-        float x = event.getRawX();
-        float y = event.getRawY();
+        float x = clampX(event.getRawX());
+        float y = clampY(event.getRawY());
+        long now = SystemClock.uptimeMillis();
 
         if (action == MotionEvent.ACTION_DOWN) {
+            mHandler.removeCallbacks(mShrinkHoleRunnable);
+            mHandler.removeCallbacks(mPendingHoverRunnable);
+            mHoverUpdateScheduled = false;
+
             mRecordingMouseGesture = true;
+            mCaughtDeviceId = event.getDeviceId();
             mCaughtStartX = x;
             mCaughtStartY = y;
-            mCaughtGestureStartTime = SystemClock.uptimeMillis();
+            mCaughtLastPathX = x;
+            mCaughtLastPathY = y;
+            mCaughtMaxDist = 0f;
+            mCaughtGestureStartTime = now;
             mCaughtGesturePath = new Path();
             mCaughtGesturePath.moveTo(x, y);
-            // Also move the spotlight hole here immediately for subsequent actions
-            applyHoleLayout((int) x, (int) y, FAST_HOLE_RADIUS_PX);
-            mHandler.removeCallbacks(mShrinkHoleRunnable);
-            mHandler.postDelayed(mShrinkHoleRunnable, SHRINK_DELAY_MS);
-        } else if (action == MotionEvent.ACTION_MOVE && mRecordingMouseGesture && mCaughtGesturePath != null) {
-            mCaughtGesturePath.lineTo(x, y);
+
+            mLastHoverX = x;
+            mLastHoverY = y;
+            mLastHoverTime = now;
+
+            // Open the hole immediately under the click so taps can replay straight through it
+            applyHoleLayout((int) x, (int) y, FAST_HOLE_RADIUS_PX, true);
+            mHoleOpenedAtCaughtPosTime = now;
+
+        } else if (action == MotionEvent.ACTION_MOVE
+                && mRecordingMouseGesture && mCaughtGesturePath != null) {
+            float distFromStart = (float) Math.hypot(x - mCaughtStartX, y - mCaughtStartY);
+            if (distFromStart > mCaughtMaxDist) {
+                mCaughtMaxDist = distFromStart;
+            }
+            float segDist = (float) Math.hypot(x - mCaughtLastPathX, y - mCaughtLastPathY);
+            if (segDist >= PATH_MIN_SEGMENT_PX) {
+                mCaughtGesturePath.lineTo(x, y);
+                mCaughtLastPathX = x;
+                mCaughtLastPathY = y;
+            }
+
         } else if ((action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL)
                 && mRecordingMouseGesture && mCaughtGesturePath != null) {
             mRecordingMouseGesture = false;
-            mCaughtGesturePath.lineTo(x, y);
-            long elapsed = SystemClock.uptimeMillis() - mCaughtGestureStartTime;
-            long duration = Math.max(20, Math.min(400, elapsed));
+            mCaughtDeviceId = -1;
+            mLastHoverX = x;
+            mLastHoverY = y;
+            mLastHoverTime = now;
+
             Path pathToReplay = mCaughtGesturePath;
             mCaughtGesturePath = null;
 
-            // Recenter hole at release point
-            applyHoleLayout((int) x, (int) y, BASE_HOLE_RADIUS_PX);
+            if (action == MotionEvent.ACTION_CANCEL) {
+                mHandler.removeCallbacks(mShrinkHoleRunnable);
+                mHandler.postDelayed(mShrinkHoleRunnable, SHRINK_DELAY_MS);
+                return;
+            }
 
-            if (action == MotionEvent.ACTION_UP) {
-                replayCaughtGesture(pathToReplay, duration);
+            float finalDistFromStart = (float) Math.hypot(x - mCaughtStartX, y - mCaughtStartY);
+            if (finalDistFromStart > mCaughtMaxDist) {
+                mCaughtMaxDist = finalDistFromStart;
+            }
+            long elapsed = now - mCaughtGestureStartTime;
+
+            if (mCaughtMaxDist < mTouchSlop) {
+                // TAP or LONG PRESS: replay straight through the already-open 240x240 hole!
+                Path tapPath = new Path();
+                tapPath.moveTo(x, y);
+                long tapDuration = (elapsed >= LONG_PRESS_THRESHOLD_MS)
+                        ? Math.max(600, Math.min(1500, elapsed))
+                        : TAP_DURATION_MS;
+                long sinceHoleMoved = now - mHoleOpenedAtCaughtPosTime;
+                long delayMs = Math.max(0, PASS_THROUGH_COMMIT_MS - sinceHoleMoved);
+                replayTapThroughHole(tapPath, tapDuration, delayMs);
+            } else {
+                // SWIPE / DRAG / FLING: ensure final endpoint is in path, then replay with pass-through
+                if (Math.hypot(x - mCaughtLastPathX, y - mCaughtLastPathY) >= 1f) {
+                    pathToReplay.lineTo(x, y);
+                }
+                long swipeDuration = Math.max(80, Math.min(1200, elapsed));
+                replayCaughtSwipe(pathToReplay, swipeDuration, (int) x, (int) y);
             }
         }
     }
 
-    private void replayCaughtGesture(Path path, long durationMs) {
+    private void replayTapThroughHole(Path tapPath, long durationMs, long delayMs) {
         if (!mStripsAttached || mWindowManager == null) return;
 
-        // Briefly make strips pass-through so the replayed gesture reaches the underlying app
+        if (mPendingDispatchRunnable != null) {
+            mHandler.removeCallbacks(mPendingDispatchRunnable);
+            mPendingDispatchRunnable = null;
+        }
+        mHandler.removeCallbacks(mShrinkHoleRunnable);
+
+        Runnable dispatchTask = () -> {
+            mPendingDispatchRunnable = null;
+            try {
+                GestureDescription.Builder builder = new GestureDescription.Builder();
+                builder.addStroke(new GestureDescription.StrokeDescription(tapPath, 0, durationMs));
+                dispatchGesture(builder.build(), new GestureResultCallback() {
+                    @Override
+                    public void onCompleted(GestureDescription gestureDescription) {
+                        scheduleHoleShrink();
+                    }
+
+                    @Override
+                    public void onCancelled(GestureDescription gestureDescription) {
+                        scheduleHoleShrink();
+                    }
+                }, mHandler);
+            } catch (Exception e) {
+                Log.w(TAG, "Tap replay failed: " + e.getMessage());
+                scheduleHoleShrink();
+            }
+        };
+
+        if (delayMs <= 0) {
+            dispatchTask.run();
+        } else {
+            mPendingDispatchRunnable = dispatchTask;
+            mHandler.postDelayed(dispatchTask, delayMs);
+        }
+    }
+
+    private void replayCaughtSwipe(Path path, long durationMs, int endX, int endY) {
+        if (!mStripsAttached || mWindowManager == null) return;
+
+        // Cancel any previous pending replay or restore timers
+        if (mPendingDispatchRunnable != null) {
+            mHandler.removeCallbacks(mPendingDispatchRunnable);
+            mPendingDispatchRunnable = null;
+        }
+        if (mRestoreTouchRunnable != null) {
+            mHandler.removeCallbacks(mRestoreTouchRunnable);
+            mRestoreTouchRunnable = null;
+        }
+        mHandler.removeCallbacks(mShrinkHoleRunnable);
+        mHandler.removeCallbacks(mPendingHoverRunnable);
+        mHoverUpdateScheduled = false;
+
+        mSwipeEndX = endX;
+        mSwipeEndY = endY;
+
+        // Make strips pass-through and wait for InputDispatcher to commit before injecting swipe
         setStripsPassThrough(true);
 
-        mHandler.postDelayed(() -> {
+        mPendingDispatchRunnable = () -> {
+            mPendingDispatchRunnable = null;
             try {
                 GestureDescription.Builder builder = new GestureDescription.Builder();
                 builder.addStroke(new GestureDescription.StrokeDescription(path, 0, durationMs));
                 boolean dispatched = dispatchGesture(builder.build(), new GestureResultCallback() {
                     @Override
                     public void onCompleted(GestureDescription gestureDescription) {
-                        setStripsPassThrough(false);
+                        finishSwipeReplay();
                     }
 
                     @Override
                     public void onCancelled(GestureDescription gestureDescription) {
-                        setStripsPassThrough(false);
+                        finishSwipeReplay();
                     }
                 }, mHandler);
 
                 if (!dispatched) {
-                    setStripsPassThrough(false);
+                    finishSwipeReplay();
+                    return;
                 }
             } catch (Exception e) {
-                setStripsPassThrough(false);
+                Log.w(TAG, "Swipe replay failed: " + e.getMessage());
+                finishSwipeReplay();
+                return;
             }
-            // Hard safety restore in case callback is delayed
-            mHandler.postDelayed(() -> setStripsPassThrough(false), durationMs + 60);
-        }, 16);
+
+            // Cancellable safety restore in case GestureResultCallback is delayed
+            mRestoreTouchRunnable = this::finishSwipeReplay;
+            mHandler.postDelayed(mRestoreTouchRunnable, durationMs + 200);
+        };
+
+        mHandler.postDelayed(mPendingDispatchRunnable, PASS_THROUGH_COMMIT_MS);
+    }
+
+    private void finishSwipeReplay() {
+        if (mRestoreTouchRunnable != null) {
+            mHandler.removeCallbacks(mRestoreTouchRunnable);
+            mRestoreTouchRunnable = null;
+        }
+        if (!mStripsAttached || mWindowManager == null) {
+            mStripsTemporarilyPassThrough = false;
+            return;
+        }
+
+        // Atomically restore touchability AND recenter the hole at the swipe release point
+        mStripsTemporarilyPassThrough = false;
+        int cx = Math.max(0, Math.min(mScreenW, mSwipeEndX));
+        int cy = Math.max(0, Math.min(mScreenH, mSwipeEndY));
+        mHoleX = cx;
+        mHoleY = cy;
+        mCurrentRadius = BASE_HOLE_RADIUS_PX;
+        computeStripRects(cx, cy, BASE_HOLE_RADIUS_PX);
+
+        for (int i = 0; i < 4; i++) {
+            if (mStrips[i] != null && mParams[i] != null) {
+                mParams[i].flags &= ~WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+                pushStripLayoutIfChanged(i);
+            }
+        }
+        mLastLayoutUpdateTime = SystemClock.uptimeMillis();
+    }
+
+    private void scheduleHoleShrink() {
+        mHandler.removeCallbacks(mShrinkHoleRunnable);
+        mHandler.postDelayed(mShrinkHoleRunnable, SHRINK_DELAY_MS);
     }
 
     private void setStripsPassThrough(boolean passThrough) {
@@ -426,18 +656,27 @@ public class TouchExplorerFallbackService extends AccessibilityService
                 } else {
                     mParams[i].flags &= ~WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
                 }
-                try {
-                    mWindowManager.updateViewLayout(mStrips[i], mParams[i]);
-                } catch (Exception ignored) {}
+                pushStripLayoutIfChanged(i);
             }
         }
+        mLastLayoutUpdateTime = SystemClock.uptimeMillis();
     }
 
     private boolean isMouseEvent(MotionEvent event) {
         if (event.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE) return true;
         int src = event.getSource();
         if ((src & InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE) return true;
+        if ((src & InputDevice.SOURCE_MOUSE_RELATIVE) == InputDevice.SOURCE_MOUSE_RELATIVE) return true;
+        if ((src & InputDevice.SOURCE_TOUCHPAD) == InputDevice.SOURCE_TOUCHPAD) return true;
         return event.getButtonState() != 0;
+    }
+
+    private float clampX(float x) {
+        return Math.max(0f, Math.min(mScreenW - 1f, x));
+    }
+
+    private float clampY(float y) {
+        return Math.max(0f, Math.min(mScreenH - 1f, y));
     }
 
     private WindowManager.LayoutParams createStripParams() {
@@ -457,23 +696,57 @@ public class TouchExplorerFallbackService extends AccessibilityService
         return p;
     }
 
-    private void applyHoleLayout(int cx, int cy, int radius) {
-        if (!mStripsAttached || mWindowManager == null) return;
+    private void applyHoleLayout(int cx, int cy, int radius, boolean force) {
+        if (!mStripsAttached || mWindowManager == null || mStripsTemporarilyPassThrough) return;
 
         cx = Math.max(0, Math.min(mScreenW, cx));
         cy = Math.max(0, Math.min(mScreenH, cy));
 
+        if (!force && radius == mCurrentRadius
+                && Math.abs(cx - mHoleX) < 4 && Math.abs(cy - mHoleY) < 4) {
+            return;
+        }
+
         mHoleX = cx;
         mHoleY = cy;
+        mCurrentRadius = radius;
         computeStripRects(cx, cy, radius);
 
+        boolean anyUpdated = false;
         for (int i = 0; i < 4; i++) {
-            if (mStrips[i] != null && mParams[i] != null) {
-                try {
-                    mWindowManager.updateViewLayout(mStrips[i], mParams[i]);
-                } catch (Exception ignored) {}
+            if (pushStripLayoutIfChanged(i)) {
+                anyUpdated = true;
             }
         }
+        if (anyUpdated) {
+            mLastLayoutUpdateTime = SystemClock.uptimeMillis();
+        }
+    }
+
+    private boolean pushStripLayoutIfChanged(int i) {
+        if (mStrips[i] == null || mParams[i] == null || mWindowManager == null) return false;
+        WindowManager.LayoutParams p = mParams[i];
+        if (p.x == mAppliedX[i] && p.y == mAppliedY[i]
+                && p.width == mAppliedW[i] && p.height == mAppliedH[i]
+                && p.flags == mAppliedFlags[i]) {
+            return false;
+        }
+        try {
+            mWindowManager.updateViewLayout(mStrips[i], p);
+            recordApplied(i);
+            return true;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private void recordApplied(int i) {
+        WindowManager.LayoutParams p = mParams[i];
+        mAppliedX[i] = p.x;
+        mAppliedY[i] = p.y;
+        mAppliedW[i] = p.width;
+        mAppliedH[i] = p.height;
+        mAppliedFlags[i] = p.flags;
     }
 
     private void computeStripRects(int cx, int cy, int radius) {
